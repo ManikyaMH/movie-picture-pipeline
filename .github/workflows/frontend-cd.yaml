@@ -6,6 +6,7 @@ on:
       - main
     paths:
       - 'starter/frontend/**'
+      - '.github/workflows/frontend-cd.yaml'
   workflow_dispatch:
 
 env:
@@ -17,6 +18,7 @@ jobs:
   lint:
     name: Frontend Lint
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -45,6 +47,7 @@ jobs:
   test:
     name: Frontend Test
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -78,8 +81,10 @@ jobs:
     needs:
       - lint
       - test
+
     outputs:
       image: ${{ steps.image.outputs.image }}
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -97,7 +102,10 @@ jobs:
           version: 'v1.34.9'
 
       - name: Configure access to EKS
-        run: aws eks update-kubeconfig --name "${EKS_CLUSTER_NAME}" --region "${AWS_REGION}"
+        run: |
+          aws eks update-kubeconfig \
+            --name "${EKS_CLUSTER_NAME}" \
+            --region "${AWS_REGION}"
 
       - name: Resolve backend URL
         id: backend
@@ -111,16 +119,24 @@ jobs:
           fi
 
           echo "Waiting for the backend LoadBalancer address..."
+
           for attempt in $(seq 1 60); do
-            host=$(kubectl get service backend -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
-            ip=$(kubectl get service backend -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
+            host=$(kubectl get service backend \
+              -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' \
+              2>/dev/null || true)
+
+            ip=$(kubectl get service backend \
+              -o jsonpath='{.status.loadBalancer.ingress[0].ip}' \
+              2>/dev/null || true)
 
             if [ -n "${host}" ]; then
+              echo "Backend URL: http://${host}"
               echo "url=http://${host}" >> "$GITHUB_OUTPUT"
               exit 0
             fi
 
             if [ -n "${ip}" ]; then
+              echo "Backend URL: http://${ip}"
               echo "url=http://${ip}" >> "$GITHUB_OUTPUT"
               exit 0
             fi
@@ -129,7 +145,8 @@ jobs:
             sleep 10
           done
 
-          echo "Backend LoadBalancer was not ready. Run Backend Continuous Deployment first, then re-run this workflow."
+          echo "Backend LoadBalancer was not ready."
+          echo "Run Backend Continuous Deployment first."
           exit 1
 
       - name: Login to Amazon ECR
@@ -138,7 +155,8 @@ jobs:
 
       - name: Set image name
         id: image
-        run: echo "image=${{ steps.login-ecr.outputs.registry }}/${ECR_REPOSITORY}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "image=${{ steps.login-ecr.outputs.registry }}/${ECR_REPOSITORY}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
 
       - name: Build Docker image
         env:
@@ -150,12 +168,14 @@ jobs:
             starter/frontend
 
       - name: Push Docker image to ECR
-        run: docker push "${{ steps.image.outputs.image }}"
+        run: |
+          docker push "${{ steps.image.outputs.image }}"
 
   deploy:
     name: Deploy Frontend to EKS
     runs-on: ubuntu-latest
     needs: build
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -176,7 +196,10 @@ jobs:
         uses: imranismail/setup-kustomize@v2
 
       - name: Configure access to EKS
-        run: aws eks update-kubeconfig --name "${EKS_CLUSTER_NAME}" --region "${AWS_REGION}"
+        run: |
+          aws eks update-kubeconfig \
+            --name "${EKS_CLUSTER_NAME}" \
+            --region "${AWS_REGION}"
 
       - name: Deploy frontend
         working-directory: starter/frontend/k8s
@@ -188,4 +211,18 @@ jobs:
           kubectl rollout status deployment/frontend --timeout=300s
 
       - name: Show frontend service
-        run: kubectl get service frontend -o wide
+        run: |
+          kubectl get service frontend -o wide
+
+      - name: Verify Kubernetes deployment
+        run: |
+          kubectl rollout status deployment/frontend --timeout=180s || true
+          echo "----- Logging - kubectl get all ---- "
+          kubectl get all
+          echo "----- Logging - kubectl describe deploy ----- "
+          kubectl describe deploy frontend
+
+      - name: Verify Frontend ECR image
+        run: |
+          echo "----- Logging - Frontend ECR Image Details ----- "
+          AWS_PAGER="" aws ecr describe-images --repository-name frontend --region us-east-1 --query 'sort_by(imageDetails,&imagePushedAt)[-1].{Tags:imageTags,Digest:imageDigest,PushedAt:imagePushedAt}' --output table
